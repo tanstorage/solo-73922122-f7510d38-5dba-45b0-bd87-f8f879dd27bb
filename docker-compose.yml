@@ -1,0 +1,59 @@
+services:
+  # 本地 IMAP 演示服务（纯 Python 标准库实现，支持删信/断流/重建注入）
+  imap:
+    build: ./imap_server
+    environment:
+      MAIL_DATA_DIR: /maildata
+      IMAP_BIND_HOST: "0.0.0.0"
+      IMAP_BIND_PORT: "143"
+      IMAP_USER: "invoicing@example.com"
+      IMAP_PASSWORD: "invoice-pass"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - maildata:/maildata
+    ports:
+      - "1430:143"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.create_connection(('127.0.0.1',143),3); d=s.recv(64); s.close(); sys.exit(0 if d.startswith(b'* OK') else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # 一次性播种任务：IMAP 就绪后写入 5 封演示邮件，成功后退出
+  imap-seed:
+    build: ./imap_server
+    depends_on:
+      imap:
+        condition: service_healthy
+    environment:
+      MAIL_DATA_DIR: /maildata
+    volumes:
+      - maildata:/maildata
+    entrypoint: ["python", "-m", "imapdemo.seed", "--data-dir", "/maildata"]
+    restart: "no"
+
+  # FastAPI + SQLite 采集服务，/docs 提供全部 API
+  collector:
+    build: ./collector
+    depends_on:
+      imap:
+        condition: service_healthy
+      imap-seed:
+        condition: service_completed_successfully
+    environment:
+      IMAP_HOST: "imap"
+      IMAP_PORT: "143"
+      IMAP_USER: "invoicing@example.com"
+      IMAP_PASSWORD: "invoice-pass"
+      IMAP_MAILBOX: "INBOX"
+      IMAP_SOCKET_TIMEOUT: "30"
+      MAX_MESSAGE_BYTES: "8388608"  # 8 MiB
+      DATA_DIR: "/data"
+    volumes:
+      - collectordata:/data
+    ports:
+      - "8000:8000"
+
+volumes:
+  maildata:
+  collectordata:
