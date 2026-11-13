@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
+import os
 import threading
+import time
 from typing import Any, Optional
 
 from .config import Settings
@@ -27,12 +29,24 @@ from .storage import Storage
 # 断流/落盘失败的邮件根本不会落库，因此仍会在后续轮次重新采集。
 TERMINAL_STATUSES = {"done", "oversize", "failed"}
 
+# 进程内标记：本进程本次启动只暂停一次，避免每封邮件都停。
+# 放在模块级是因为演示开关的语义就是"首份 PDF"。
+_demo_paused_once = False
+
+
+def _reset_demo_pause() -> None:
+    global _demo_paused_once
+    _demo_paused_once = False
+
 
 class Collector:
-    def __init__(self, settings: Settings, db: Database, storage: Storage) -> None:
+    def __init__(self, settings: Settings, db: Database, storage: Storage,
+                 owner_token: Optional[str] = None) -> None:
         self._settings = settings
         self._db = db
         self._storage = storage
+        # 本 API 进程的登记 token：写入运行记录，供恢复逻辑判定"活主/死主"
+        self._owner_token = owner_token
         self._process_lock = ProcessLock(settings.lock_path)
         # 同进程并发触发保护：第二个请求立即失败，不排队
         self._thread_lock = threading.Lock()
@@ -41,7 +55,7 @@ class Collector:
         if not self._thread_lock.acquire(blocking=False):
             raise CollectionBusyError("本进程已有采集在执行")
         try:
-            # 跨进程排他锁：容器内若有第二个采集进程，拿不到锁
+            # 跨进程排他锁：另一 API 进程若正在采集，本进程拿不到锁 → 409
             with self._process_lock:
                 return self._run_locked()
         finally:
@@ -52,7 +66,8 @@ class Collector:
         s = self._settings
         db = self._db
         storage = self._storage
-        run_id = db.start_run(uidvalidity=None, epoch_id=None)
+        run_id = db.start_run(uidvalidity=None, epoch_id=None,
+                              owner_token=self._owner_token)
         counters = {
             "total_seen": 0, "processed_ok": 0, "failed": 0,
             "oversize": 0, "skipped_terminal": 0, "attachments_saved": 0,
@@ -78,7 +93,8 @@ class Collector:
                         continue
 
                     outcome = self._process_one(
-                        session, storage, uidvalidity, epoch_id, uid, counters
+                        session, storage, uidvalidity, epoch_id, uid,
+                        counters, run_id
                     )
                     if outcome is not None:
                         # IMAP/磁盘级故障：中止本轮，未处理的邮件下轮续采
@@ -101,11 +117,14 @@ class Collector:
     # ------------------------------------------------------------------
     def _process_one(self, session: ImapSession, storage: Storage,
                      uidvalidity: int, epoch_id: int, uid: int,
-                     counters: dict[str, int]) -> Optional[str]:
+                     counters: dict[str, int], run_id: int) -> Optional[str]:
         """处理单封邮件。返回 None 表示成功/可继续；返回字符串表示中止原因。"""
         db = self._db
         limit = self._settings.max_message_bytes
-        staging = storage.new_staging_dir()
+        staging = storage.new_staging_dir(run_id)
+        # 在动任何数据之前就登记本封的暂存目录：崩溃恢复可按运行精确回收，
+        # 且新运行/新任务永远不会被"按前缀扫描"式清理误伤。
+        db.set_run_staging(run_id, staging)
         try:
             # 1) 先查声明大小，超限不拉正文（第一道 8MiB 校验）
             declared_size = session.fetch_size(uid)
@@ -133,8 +152,12 @@ class Collector:
                 return None
 
             # 5) 全部附件先落 staging（任一失败即整封放弃）
+            staged_any = False
             for part in parts:
                 storage.write_staged(staging, part)
+                if not staged_any and self._settings.demo_pause_after_first_pdf:
+                    staged_any = True
+                    self._demo_pause_after_first_pdf(uid, staging)
 
             # 6) 整封原子发布到正式目录
             try:
@@ -177,6 +200,46 @@ class Collector:
             # 无论成功、失败、断流还是进程异常路径，该封 staging 必须清空，
             # 绝不留下任何半封附件痕迹
             storage.discard(staging)
+            db.set_run_staging(run_id, None)
+
+    # ------------------------------------------------------------------
+    def _demo_pause_after_first_pdf(self, uid: int, staging: str) -> None:
+        """演示开关：首份 PDF 已落 staging 后暂停，便于观察在途状态。
+
+        暂停期间该运行的记录保持 running、staging 里保留完整可续采的半封：
+        - 此时重启另一个 API 进程，其启动恢复必须原样保留它们；
+        - 此时强制终止本采集进程，后续启动才会把它标 aborted 并回收暂存。
+
+        放行条件：写入 demo/release 文件，或到达 DEMO_PAUSE_MAX_SECONDS。
+        """
+        global _demo_paused_once
+        if _demo_paused_once:
+            return
+        _demo_paused_once = True
+
+        s = self._settings
+        try:
+            os.makedirs(s.demo_dir, exist_ok=True)
+            # 标记"本进程当前处于暂停中"，供演示脚本观测
+            with open(s.demo_hold_file, "w", encoding="utf-8") as fh:
+                fh.write(f"pid={os.getpid()}\nuid={uid}\nstaging={staging}\n")
+        except OSError as exc:
+            print(f"[demo] 写入暂停标记失败: {exc}")
+            return
+        try:
+            os.remove(s.demo_release_file)
+        except FileNotFoundError:
+            pass
+
+        deadline = time.monotonic() + s.demo_pause_max_seconds
+        while time.monotonic() < deadline:
+            if os.path.exists(s.demo_release_file):
+                break
+            time.sleep(0.2)
+        try:
+            os.remove(s.demo_hold_file)
+        except FileNotFoundError:
+            pass
 
     # ------------------------------------------------------------------
     def _commit_oversize(self, epoch_id: int, uid: int, size: int) -> None:

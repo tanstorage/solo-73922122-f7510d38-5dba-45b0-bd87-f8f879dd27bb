@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS collection_runs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     epoch_id            INTEGER REFERENCES mailbox_epochs(id),
     uidvalidity         INTEGER,
+    owner_token         TEXT,
+    staging_dir         TEXT,
     started_at          TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at         TEXT,
     status              TEXT NOT NULL DEFAULT 'running'
@@ -63,6 +65,12 @@ CREATE TABLE IF NOT EXISTS collection_runs (
 );
 """
 
+# 旧库平滑升级：CREATE TABLE IF NOT EXISTS 不会补列，这里显式补齐。
+MIGRATIONS = (
+    ("collection_runs", "owner_token", "ALTER TABLE collection_runs ADD COLUMN owner_token TEXT"),
+    ("collection_runs", "staging_dir", "ALTER TABLE collection_runs ADD COLUMN staging_dir TEXT"),
+)
+
 
 class Database:
     def __init__(self, db_path: str) -> None:
@@ -76,14 +84,18 @@ class Database:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
-            # 上次进程退出时仍处于 running 的采集，标记为 aborted（可被重新采集）
-            self._conn.execute(
-                "UPDATE collection_runs SET status='aborted', "
-                "finished_at=datetime('now'), "
-                "note=COALESCE(note,'') || ' [进程重启，自动中断标记]' "
-                "WHERE status='running'"
-            )
-            self._conn.commit()
+            self._migrate()
+            # 注意：这里不再"看到 running 就标 aborted"。
+            # 两个 API 进程共库，另一进程可能正持有 running 记录在采集；
+            # 只有确认持有者已死亡时才允许回收，见 modules/recovery.py。
+
+    def _migrate(self) -> None:
+        for _table, column, ddl in MIGRATIONS:
+            cols = {row["name"] for row in
+                    self._conn.execute(f"PRAGMA table_info({_table})").fetchall()}
+            if column not in cols:
+                self._conn.execute(ddl)
+        self._conn.commit()
 
     # ---- 基础工具 ----
     @property
@@ -145,22 +157,56 @@ class Database:
         return self.query_all("SELECT * FROM mailbox_epochs ORDER BY id")
 
     # ---- 采集运行记录 ----
-    def start_run(self, uidvalidity: Optional[int], epoch_id: Optional[int]) -> int:
+    def start_run(self, uidvalidity: Optional[int], epoch_id: Optional[int],
+                  owner_token: Optional[str] = None) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO collection_runs(epoch_id, uidvalidity) VALUES (?, ?)",
-                (epoch_id, uidvalidity),
+                "INSERT INTO collection_runs(epoch_id, uidvalidity, owner_token) "
+                "VALUES (?, ?, ?)",
+                (epoch_id, uidvalidity, owner_token),
             )
             self._conn.commit()
             return int(cur.lastrowid)
 
-    def finish_run(self, run_id: int, status: str, counters: dict[str, int],
-                   note: Optional[str] = None) -> None:
+    def set_run_staging(self, run_id: int, staging_dir: Optional[str]) -> None:
+        """登记当前半封暂存目录，供崩溃后按运行精确回收（不会误删新任务）。"""
         with self._lock:
             self._conn.execute(
+                "UPDATE collection_runs SET staging_dir=? WHERE id=?",
+                (staging_dir, run_id),
+            )
+            self._conn.commit()
+
+    def find_live_run(self) -> Optional[sqlite3.Row]:
+        """是否存在仍处于 running 的采集（任一进程的）。"""
+        return self.query_one(
+            "SELECT * FROM collection_runs WHERE status='running' "
+            "ORDER BY id DESC LIMIT 1"
+        )
+
+    def abort_run(self, run_id: int, note: str) -> bool:
+        """仅当运行仍为 running 时标 aborted（幂等，不覆盖已完成运行）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE collection_runs SET status='aborted', "
+                "finished_at=datetime('now'), staging_dir=NULL, "
+                "note=COALESCE(note,'') || ? "
+                "WHERE id=? AND status='running'",
+                (note, run_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def finish_run_if_running(self, run_id: int, status: str,
+                              counters: dict[str, int],
+                              note: Optional[str] = None) -> bool:
+        """采集正常结束时的收尾；若运行已被恢复逻辑标为 aborted 则不再改写。"""
+        with self._lock:
+            cur = self._conn.execute(
                 "UPDATE collection_runs SET status=?, finished_at=datetime('now'), "
                 "total_seen=?, processed_ok=?, failed=?, oversize=?, "
-                "skipped_terminal=?, attachments_saved=?, note=? WHERE id=?",
+                "skipped_terminal=?, attachments_saved=?, note=?, staging_dir=NULL "
+                "WHERE id=? AND status='running'",
                 (
                     status,
                     counters.get("total_seen", 0),
@@ -174,6 +220,20 @@ class Database:
                 ),
             )
             self._conn.commit()
+            return cur.rowcount > 0
+
+    def finish_run(self, run_id: int, status: str, counters: dict[str, int],
+                   note: Optional[str] = None) -> None:
+        self.finish_run_if_running(run_id, status, counters, note=note)
+
+    def run_status(self, run_id: int) -> Optional[str]:
+        row = self.query_one(
+            "SELECT status FROM collection_runs WHERE id=?", (run_id,)
+        )
+        return row["status"] if row is not None else None
+
+    def get_run(self, run_id: int) -> Optional[sqlite3.Row]:
+        return self.query_one("SELECT * FROM collection_runs WHERE id=?", (run_id,))
 
     def list_runs(self, limit: int = 50) -> list[sqlite3.Row]:
         return self.query_all(

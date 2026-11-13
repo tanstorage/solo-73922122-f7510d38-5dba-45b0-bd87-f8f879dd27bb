@@ -12,10 +12,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .collector import Collector
+from .collector import Collector, _reset_demo_pause
 from .config import load_settings
 from .database import Database
 from .process_lock import CollectionBusyError
+from .recovery import Recovery
+from .runtime import ProcessRegistry
 from .storage import Storage
 
 
@@ -58,7 +60,10 @@ class EpochOut(BaseModel):
 
 class RunOut(BaseModel):
     id: int
+    epoch_id: Optional[int]
     uidvalidity: Optional[int]
+    owner_token: Optional[str]
+    staging_dir: Optional[str]
     started_at: str
     finished_at: Optional[str]
     status: str
@@ -84,17 +89,33 @@ state: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = load_settings()
+    # 1) 先登记本进程身份（持锁存活），再碰数据库恢复：
+    #    这样恢复逻辑绝不会把"正在启动、马上要采集的进程"误判为死主。
+    registry = ProcessRegistry(settings.runtime_dir)
+    registry.register()
+
     db = Database(settings.db_path)
     storage = Storage(settings.blob_root, settings.staging_dir)
-    # 清理上次进程崩溃遗留的 staging 临时件
-    removed = storage.cleanup_stale_staging()
+
+    # 2) 启动恢复：只回收已死亡进程遗留的运行与暂存。
+    #    另一 API 进程仍在采集时，其 running 记录与 staging 原样保留。
+    recovery = Recovery(db, storage, registry, settings.runtime_dir,
+                        settings.lock_path)
+    recovery_result = recovery.run()
+
+    _reset_demo_pause()
     state["settings"] = settings
     state["db"] = db
     state["storage"] = storage
-    state["collector"] = Collector(settings, db, storage)
-    state["stale_staging_cleaned"] = removed
-    yield
-    db.close()
+    state["registry"] = registry
+    state["recovery"] = recovery_result
+    state["collector"] = Collector(settings, db, storage,
+                                   owner_token=registry.token)
+    try:
+        yield
+    finally:
+        db.close()
+        registry.unregister()
 
 
 app = FastAPI(
@@ -104,9 +125,11 @@ app = FastAPI(
         "- 只读 EXAMINE + BODY.PEEK，不改变邮件已读状态；\n"
         "- 每封 ≤ 8MiB，提取全部 application/pdf，按 MIME 部分序号区分同名附件；\n"
         "- 附件全部落盘后，索引与进度同事务提交，绝不暴露半封附件；\n"
-        "- 邮箱重建（UIDVALIDITY 变化）后在新 UID 空间重新采集，旧原件仍可查询。"
+        "- 邮箱重建（UIDVALIDITY 变化）后在新 UID 空间重新采集，旧原件仍可查询；\n"
+        "- 多个此 API 进程共享同一 SQLite 与原件目录：启动只回收已死亡进程的运行，\n"
+        "  全局仍只有一轮采集（另一入口触发返回 409）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -143,9 +166,24 @@ def _message_out(row, attachments: Optional[list] = None) -> MessageOut:
 # ---------------------------------------------------------------- 健康检查
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health() -> dict:
+    registry: ProcessRegistry = state["registry"]
+    db: Database = state["db"]
     return {
         "status": "ok",
-        "stale_staging_cleaned_on_boot": state.get("stale_staging_cleaned", 0),
+        "process_token": registry.token,
+        "startup_recovery": state.get("recovery", {}),
+        "live_runs": [
+            {
+                "id": r["id"],
+                "owner_alive": registry.alive(r["owner_token"]),
+                "uidvalidity": r["uidvalidity"],
+                "started_at": r["started_at"],
+            }
+            for r in db.query_all(
+                "SELECT * FROM collection_runs WHERE status='running' ORDER BY id"
+            )
+        ],
+        "processes": registry.describe_all(),
     }
 
 

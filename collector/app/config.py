@@ -24,11 +24,29 @@ class Settings:
     blob_root: str          # PDF 原件根目录
     staging_dir: str        # 半封附件的临时落盘区（对外不可见）
     lock_path: str          # 单采集进程文件锁
+    runtime_dir: str        # 进程身份/存活登记与恢复互斥锁
+
+    # ---- 演示开关 ----
+    # 打开后，本轮采集在首份 PDF 写入 staging 之后暂停，便于演示：
+    # 暂停期间重启另一个 API 进程（其启动恢复不得动这条 running 记录与暂存），
+    # 以及强制终止采集进程后由后续启动把它标记 aborted 并回收暂存。
+    demo_pause_after_first_pdf: bool
+    demo_pause_max_seconds: float
+    demo_dir: str
+    demo_hold_file: str
+    demo_release_file: str
 
 
 def _env(key: str, default: str) -> str:
     value = os.environ.get(key)
     return value if value not in (None, "") else default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
@@ -46,4 +64,10 @@ def load_settings() -> Settings:
         blob_root=os.path.join(data_dir, "blobs"),
         staging_dir=os.path.join(data_dir, "staging"),
         lock_path=os.path.join(data_dir, "collect.lock"),
+        runtime_dir=os.path.join(data_dir, "run"),
+        demo_pause_after_first_pdf=_env_bool("DEMO_PAUSE_AFTER_FIRST_PDF", False),
+        demo_pause_max_seconds=float(_env("DEMO_PAUSE_MAX_SECONDS", "20")),
+        demo_dir=os.path.join(data_dir, "demo"),
+        demo_hold_file=os.path.join(data_dir, "demo", "hold"),
+        demo_release_file=os.path.join(data_dir, "demo", "release"),
     )
